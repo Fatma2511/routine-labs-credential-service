@@ -14,15 +14,13 @@ specific implementation choices, and pushed back when something was wrong.
 
 ---
 
-## Critical correction I made: hashing vs. encryption
+## Correction 1 — Hashing vs. encryption
 
 **What Claude initially built:**
 
 Claude's first version used **Argon2id password hashing** to store the credentials.
 The implementation was technically correct for a login system — but completely
 wrong for this use case.
-
-The first version stored credentials like this:
 
 ```python
 # Claude's first (wrong) approach
@@ -42,102 +40,141 @@ This is a credential storage service for automation workflows — the service
 needs to log into Salesforce, Jira, or other third-party systems on behalf of
 the user. That means the plaintext password must be recoverable.
 
-Hashing is a one-way function. You cannot get `"my-password"` back from its
+Hashing is a one-way function. You cannot get "my-password" back from its
 Argon2 hash. Claude had missed this fundamental distinction.
 
 **What I told Claude to change:**
 
 I pointed out the mismatch and asked Claude to rebuild the solution using
-**reversible encryption** instead. Claude then switched to Fernet (AES-128)
+reversible encryption instead. Claude then switched to Fernet (AES-128)
 which is the correct pattern for this use case.
-
-**Why this matters:**
-
-This is the central security decision in the entire exercise. Getting it wrong
-would have meant storing credentials that the automation worker could never
-actually use. The task description explicitly called this out as the key
-evaluation criterion — and the AI missed it on the first attempt.
 
 ---
 
-## Second correction: missing error handling
+## Correction 2 — Missing error handling
 
 **What Claude initially built:**
 
-The routes had no error handling around database operations. For example:
+The routes had no error handling around database operations:
 
 ```python
 # Claude's first version — no error handling
 db.add(record)
-db.commit()      # if the database is down, this raises an unhandled exception
+db.commit()      # if the database is down, unhandled exception
 db.refresh(record)
 ```
 
 If the database was unreachable, the service would crash with an unhandled
-SQLAlchemy exception and return an unformatted 500 error with internal
-stack trace details visible to the client.
-
-Similarly, `encrypt_password()` had no try/except — any unexpected failure
-would bubble up uncontrolled.
-
-**Why I asked for the change:**
-
-A production backend service must handle downstream failures gracefully.
-The database is an external dependency — it can be unavailable, slow, or
-return unexpected errors. The service should:
-
-- Catch these errors explicitly
-- Roll back any partial database changes
-- Log the full error server-side
-- Return a clean, generic 500 message to the client without leaking internals
-
-I also pointed out that the PATCH endpoint had no validation for an empty
-body — sending `{}` would silently do nothing, which is a semantic error
-that should return 400.
+SQLAlchemy exception and return a raw 500 error with internal details visible
+to the client. Similarly, encrypt_password() had no try/except.
 
 **What I asked Claude to add:**
 
-- `try/except SQLAlchemyError` around every `db.commit()`, `db.delete()`,
-  and `db.get()` call
-- `db.rollback()` in every except block
+- try/except SQLAlchemyError around every db.commit(), db.delete(), and db.get()
+- db.rollback() in every except block to prevent partial writes
 - A 400 check in the PATCH route for empty bodies
 - A test that simulates a real key-rotation failure (wrong key → 500)
 
 ---
 
+## Correction 3 — Everything in one file
+
+**What Claude initially built:**
+
+All logic — configuration, database setup, ORM model, Pydantic schemas,
+encryption helpers, and all routes — was in a single app.py file.
+This makes the code hard to read, test in isolation, and extend.
+
+**What I asked Claude to change:**
+
+I asked Claude to split the code into separate modules, each with a single
+responsibility:
+
+```
+src/
+├── main.py        ← app instance and startup
+├── config.py      ← environment variables and Fernet key init
+├── database.py    ← SQLAlchemy engine and session
+├── models.py      ← ORM model
+├── schemas.py     ← Pydantic schemas
+├── encryption.py  ← encrypt / decrypt logic
+└── routes.py      ← API endpoints
+```
+
+---
+
+## Correction 4 — .env not loaded at startup
+
+**What Claude initially built:**
+
+python-dotenv was listed in requirements.txt but load_dotenv() was
+never actually called. This meant the .env file was never read at startup —
+ENCRYPTION_KEY would always be empty and the app would crash immediately
+unless the variables were exported manually in the shell.
+
+**What I told Claude to fix:**
+
+I noticed the .env was never loaded and asked Claude to add load_dotenv()
+at the top of config.py, before any os.getenv() call:
+
+```python
+from dotenv import load_dotenv
+load_dotenv()  # must run before os.getenv()
+```
+
+---
+
+## Correction 5 — system_identifier not unique
+
+**What Claude initially built:**
+
+There was no unique constraint on system_identifier. The same system could
+be stored multiple times, creating ambiguous duplicate records. An automation
+worker looking up credentials for "salesforce-prod" could get multiple results
+and would not know which one to use.
+
+**What I asked Claude to fix:**
+
+I pointed out that only one credential per system should be allowed and asked
+Claude to add a unique constraint at the database level and a 409 response
+at the API level:
+
+```python
+# models.py
+system_identifier = Column(String(128), nullable=False, unique=True)
+```
+
+```python
+# routes.py — explicit 409 before hitting the DB
+existing = db.query(CredentialRecord).filter_by(
+    system_identifier=body.system_identifier
+).first()
+if existing:
+    raise HTTPException(status_code=409, detail="Already exists...")
+```
+
+---
+
 ## Where I agreed with Claude's suggestions
 
-- **FastAPI over Flask or Django REST**: I agreed with this choice.
-  Flask would require too much manual wiring. Django REST is oversized
-  for a small service. FastAPI with Pydantic is the right fit.
-
-- **Fernet over raw AES**: Once the encryption approach was agreed,
-  I accepted Claude's suggestion to use Fernet rather than building
-  AES-CBC + HMAC manually. Fernet is a well-audited, hard-to-misuse
-  abstraction and is the right choice for this scope.
-
-- **Metadata / secret endpoint split**: Separating the normal metadata
-  endpoints from the `/secret` endpoint that returns decrypted passwords
-  is a clean design. It makes the sensitive surface area explicit and
-  easy to protect separately in production.
-
-- **SQLite for dev, PostgreSQL for prod**: Reasonable trade-off for a
-  small exercise. The `DATABASE_URL` environment variable makes the
-  switch trivial.
+- **FastAPI over Flask or Django REST** — right fit for the task size
+- **Fernet over raw AES** — well-audited, hard to misuse, correct abstraction level
+- **Metadata / secret endpoint split** — clean way to isolate the sensitive surface
+- **SQLite for dev, PostgreSQL for prod** — pragmatic trade-off, easy to switch
 
 ---
 
 ## Summary
 
-The two decisions that materially shaped the final solution were both mine:
+The decisions that materially shaped the final solution were all mine:
 
-1. Recognising that hashing was the wrong security pattern for this use case
-   and insisting on reversible encryption instead.
+1. Recognising that hashing was wrong for this use case — encryption was needed
+2. Requiring explicit error handling for all downstream failures
+3. Splitting the code into separate modules for clarity and extensibility
+4. Noticing that load_dotenv() was never called — the .env bug
+5. Identifying that system_identifier needed a unique constraint
 
-2. Identifying that database and encryption failures were unhandled downstream
-   errors and requiring explicit error handling with rollback and clean HTTP
-   responses.
+The AI was useful for generating boilerplate, structuring modules, and writing
+tests — but every significant engineering decision came from reading the task
+carefully and reviewing the output critically.
 
-The AI was useful for generating boilerplate, structuring the project, and
-writing tests — but the two most important engineering judgements came from
-reading the task carefully and pushing back on the initial output.
