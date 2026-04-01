@@ -6,24 +6,46 @@ A Python backend service that securely stores login credentials for external thi
 
 ## The core design decision: encryption, not hashing
 
-This service stores credentials that an automation worker must later use to log into external systems. Because the **plaintext password must be recoverable**, one-way hashing (bcrypt, Argon2) is not appropriate here — a hash cannot be reversed.
+This service stores credentials that an automation worker must later use to log into external systems. Because the **plaintext password must be recoverable**, one-way hashing (bcrypt, Argon2) is not appropriate — a hash cannot be reversed.
 
-Instead, passwords are protected with **symmetric authenticated encryption** using AES-128 via the [Fernet](https://cryptography.io/en/latest/fernet/) construction from the Python `cryptography` library:
+Instead, passwords are protected with **symmetric authenticated encryption** using AES-128 via [Fernet](https://cryptography.io/en/latest/fernet/):
 
-- The password is encrypted before any write to the database.
-- Only the ciphertext is stored — the plaintext and the encryption key never coexist in a database row.
-- Fernet provides both **confidentiality** (AES-128-CBC) and **integrity** (HMAC-SHA256). A tampered ciphertext is rejected at decryption time.
-- The encryption key lives in an environment variable (`ENCRYPTION_KEY`). In production this should come from a secrets manager (Vault, AWS Secrets Manager, GCP Secret Manager) — not a `.env` file.
+- The password is encrypted before any write to the database
+- Only the ciphertext is stored — the plaintext and the key never coexist in a DB row
+- Fernet provides both **confidentiality** (AES-128-CBC) and **integrity** (HMAC-SHA256)
+- The encryption key is loaded from the `ENCRYPTION_KEY` environment variable via `python-dotenv` — in production this should come from a secrets manager
 
 ---
 
-## Quick start (local)
+## Project structure
 
-### 1. Clone and install dependencies
+```
+src/
+├── __init__.py      ← makes src a Python package
+├── main.py          ← app instance, middleware, startup
+├── config.py        ← loads .env, validates and exposes config
+├── database.py      ← SQLAlchemy engine, session, Base
+├── models.py        ← ORM model (credentials table)
+├── schemas.py       ← Pydantic request/response models
+├── encryption.py    ← encrypt_password / decrypt_password
+└── routes.py        ← all API endpoints
+tests/
+└── test_credentials.py
+docs/
+├── architecture.md
+└── ai_usage.md
+```
+
+Each module has a single responsibility. This makes the code easier to read,
+test in isolation, and extend without touching unrelated parts.
+
+---
+
+## Quick start
+
+### 1. Install dependencies
 
 ```bash
-git clone <repo>
-cd routine-labs-credentials
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
@@ -44,8 +66,7 @@ cp .env.example .env
 ### 4. Start the service
 
 ```bash
-# From the repo root
-uvicorn src.app:app --reload --port 8000
+uvicorn src.main:app --reload --port 8000
 ```
 
 API docs available at: http://localhost:8000/docs
@@ -58,16 +79,11 @@ pytest tests/ -v
 
 ---
 
-## Docker (with PostgreSQL)
+## Docker
 
 ```bash
-# 1. Set your encryption key in .env (same step as above)
-
-# 2. Start everything
+# Set ENCRYPTION_KEY in .env first
 docker compose up --build
-
-# Service: http://localhost:8000
-# PostgreSQL: localhost:5432
 ```
 
 ---
@@ -100,14 +116,14 @@ Response (no password):
 }
 ```
 
-### List credentials (metadata only)
+### List credentials (no passwords)
 
 ```bash
 curl http://localhost:8000/credentials
 curl "http://localhost:8000/credentials?system_identifier=salesforce-prod"
 ```
 
-### Retrieve decrypted credential (internal services only)
+### Retrieve decrypted password (internal only)
 
 ```bash
 curl http://localhost:8000/credentials/{id}/secret
@@ -134,14 +150,16 @@ curl -X DELETE http://localhost:8000/credentials/{id}
 | Method | Path | Description | Returns password? |
 |---|---|---|---|
 | `POST` | `/credentials` | Store a new credential | No |
-| `GET` | `/credentials` | List all (optional `?system_identifier=` filter) | No |
-| `GET` | `/credentials/{id}` | Get metadata for one credential | No |
-| `GET` | `/credentials/{id}/secret` | Get credential with decrypted password | **Yes** |
-| `PATCH` | `/credentials/{id}` | Update username, password, or label | No |
-| `DELETE` | `/credentials/{id}` | Remove a credential | — |
+| `GET` | `/credentials` | List all (filter by `?system_identifier=`) | No |
+| `GET` | `/credentials/{id}` | Get metadata | No |
+| `GET` | `/credentials/{id}/secret` | Get with decrypted password | **Yes** |
+| `PATCH` | `/credentials/{id}` | Update fields | No |
+| `DELETE` | `/credentials/{id}` | Remove | — |
 | `GET` | `/health` | Liveness probe | — |
 
-The `/secret` endpoint is the only one that returns a decrypted password. In production it should be protected by an internal network policy, mTLS, or a service token, and should never be publicly routable.
+The `/secret` endpoint is the only surface that returns a plaintext password.
+In production it must be protected by an internal network policy, mTLS, or a
+service token — it should never be publicly routable.
 
 ---
 
@@ -151,7 +169,7 @@ The `/secret` endpoint is the only one that returns a decrypted password. In pro
 credentials table
 ─────────────────────────────────────────────────────────
  id                  UUID (PK)
- system_identifier   VARCHAR(128)
+ system_identifier   VARCHAR(128)   UNIQUE
  username            VARCHAR(256)
  encrypted_password  TEXT           Fernet token (AES-128 ciphertext)
  label               VARCHAR(256)   nullable
@@ -160,25 +178,23 @@ credentials table
 ─────────────────────────────────────────────────────────
 ```
 
-The `encrypted_password` column contains a Fernet token: a base64url string that embeds the version, timestamp, IV, ciphertext, and HMAC. The plaintext never appears in the database.
+`system_identifier` is unique — only one credential per third-party system is
+allowed. Submitting the same identifier twice returns 409. Use
+`PATCH /credentials/{id}` to update an existing credential.
 
 ---
 
 ## Security considerations
 
-**Encryption key management** is the critical trust boundary. A few notes:
+- Passwords are encrypted with Fernet (AES-128-CBC + HMAC-SHA256) before any DB write
+- The `ENCRYPTION_KEY` is loaded at startup via `python-dotenv` — never hardcoded
+- Logs never contain passwords — only credential IDs and system identifiers
+- SQL injection is prevented by SQLAlchemy's parameterised queries throughout
+- The `/secret` endpoint is the only route that returns plaintext — treat as internal-only
+- All database errors are caught explicitly — no raw stack traces reach the client
 
-- The key must be stored separately from the database. If both are compromised simultaneously, all passwords are exposed.
-- Key rotation requires re-encrypting all stored values with the new key before retiring the old one. This is not implemented here but should be a production concern.
-- In a real deployment: store the key in AWS Secrets Manager / GCP Secret Manager / HashiCorp Vault, not in a `.env` file.
-
-**The `/secret` endpoint** exposes decrypted passwords. It must be treated as an internal-only API surface. Options for protecting it in production: mTLS between services, an API gateway that blocks it from public routes, or a service token validated in middleware.
-
-**Logs never contain passwords.** The logger redacts usernames too, only logging the credential ID and system identifier.
-
-**SQL injection** is prevented by SQLAlchemy's ORM with parameterised queries throughout.
-
-**Input validation** is enforced by Pydantic before any logic runs. The `system_identifier` field only accepts safe characters (letters, digits, hyphens, underscores, dots).
+**Key management in production:** Store `ENCRYPTION_KEY` in a secrets manager
+(AWS Secrets Manager, HashiCorp Vault, GCP Secret Manager) rather than a `.env` file.
 
 ---
 
@@ -186,31 +202,44 @@ The `encrypted_password` column contains a Fernet token: a base64url string that
 
 | Area | Decision | Trade-off |
 |---|---|---|
-| Encryption algorithm | Fernet (AES-128-CBC + HMAC-SHA256) | Simple, well-audited. AES-256-GCM would offer stronger confidentiality; Fernet is slightly simpler to operate correctly. |
-| Key storage | Environment variable | Easy to operate locally; must be replaced with a secrets manager in production. |
-| Database | SQLite (dev) / PostgreSQL (prod) | SQLite requires no infrastructure; PostgreSQL is the right choice for anything beyond a single server. |
-| Key rotation | Not implemented | A production service should support dual-key decryption during rotation windows. |
-| `/secret` auth | Not implemented | Marked in code; in production this needs mTLS or a service token. |
-| Rate limiting | Not implemented | Should be added (e.g. `slowapi`) before production to prevent enumeration. |
+| Encryption | Fernet (AES-128) | Simple and well-audited. AES-256-GCM would be stronger; Fernet is easier to operate correctly. |
+| Key storage | Environment variable | Simple for local dev; must use a secrets manager in production. |
+| Database | SQLite (dev) / PostgreSQL (prod) | SQLite needs no infrastructure; swap via `DATABASE_URL`. |
+| Key rotation | Not implemented | Production should support dual-key decryption during rotation windows. |
+| `/secret` auth | Not implemented | Needs mTLS or service token before going public. |
+| Rate limiting | Not implemented | Should be added (e.g. `slowapi`) in production. |
 
 ---
 
 ## Decision log
 
 **Framework — FastAPI**
-FastAPI offers async support, automatic OpenAPI docs, and Pydantic integration for schema validation. It is the pragmatic modern choice for a small Python API without the ceremony of Django.
+FastAPI with Pydantic gives automatic input validation, OpenAPI docs, and clean
+dependency injection. Flask would require too much manual wiring; Django REST is
+oversized for a small service.
 
 **Database — SQLite (dev) / PostgreSQL (prod)**
-SQLite requires zero infrastructure and is appropriate for local development. The `DATABASE_URL` environment variable makes it trivial to swap to PostgreSQL for any real deployment.
+SQLite requires no infrastructure and works immediately for local development.
+The `DATABASE_URL` variable makes the switch to PostgreSQL trivial.
 
 **Security pattern — Fernet encryption (not hashing)**
-The task explicitly states that passwords must later be used to log into external systems. This means the plaintext must be recoverable, ruling out one-way hashing. Fernet (AES-128-CBC + HMAC-SHA256) provides both confidentiality and tamper detection with a clean Python API, without requiring low-level AES plumbing.
+The task requires passwords to be reused to log into external systems — the
+plaintext must be recoverable. One-way hashing is therefore not suitable.
+Fernet provides confidentiality and tamper detection with a clean Python API.
 
-**API design — metadata / secret split**
-The standard credential endpoints return metadata only. A separate `/secret` endpoint returns the decrypted password. This makes it easy to audit who is requesting plaintext passwords, and makes it straightforward to protect that single route in production (network policy, mTLS, service token) without restricting access to metadata.
+**system_identifier uniqueness**
+Only one credential per system is allowed. This prevents ambiguity when an
+automation worker looks up which credential to use for a given system.
+
+**Project structure**
+Logic is split across six modules, each with a single responsibility. This makes
+the codebase easier to read, test, and extend without touching unrelated parts.
 
 ---
 
 ## AI usage
 
-See [docs/ai_usage.md](docs/ai_usage.md) for a full account of how AI tools were used during development, which decisions were materially my own, and where I disagreed with or corrected AI-generated suggestions.
+See [docs/ai_usage.md](docs/ai_usage.md) for a full account of how AI tools
+were used during development, which decisions were materially my own, and where
+I disagreed with or corrected AI-generated suggestions.
+
